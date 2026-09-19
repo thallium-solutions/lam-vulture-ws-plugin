@@ -1,0 +1,86 @@
+# Ported central lamserver_ws test: verifies an upgrade + echo round-trip and
+# that route query parameters survive the upgrade for the handler.
+#
+# expect: echo reply: echo: hello
+# expect: upper reply: WORLD!
+# expect: ok
+
+from lamstrings import Strings
+from @lam/vulture import Server, Request
+from @lam/vulture/ws-plugin import WebSocket, wsRoute
+
+go! {
+    import (
+        "fmt"
+        "github.com/gorilla/websocket"
+        "io"
+        "net/http"
+        "net/url"
+        "time"
+    )
+
+    // The native test client intentionally retains Gorilla frame operations,
+    // net/http handshake types, and a read deadline.
+    func wsClientRoundtrip(rawURL, message string) string {
+        parsed, parseErr := url.Parse(rawURL)
+        if parseErr != nil {
+            return "ERR-parse: " + parseErr.Error()
+        }
+        dialer := websocket.Dialer{HandshakeTimeout: 2 * time.Second}
+        conn, response, err := dialer.Dial(parsed.String(), http.Header{})
+        if err != nil {
+            extra := ""
+            if response != nil {
+                body, _ := io.ReadAll(response.Body)
+                extra = fmt.Sprintf(" (status=%d body=%q)", response.StatusCode, string(body))
+            }
+            return "ERR-dial: " + err.Error() + extra
+        }
+        defer conn.Close()
+        if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+            return "ERR-write: " + err.Error()
+        }
+        _ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+        _, reply, err := conn.ReadMessage()
+        if err != nil {
+            return "ERR-read: " + err.Error()
+        }
+        return string(reply)
+    }
+}
+
+func echoHandler(ws: WebSocket, _req: Request) {
+    message: str = ws.recv()
+    if message == "" {
+        return
+    }
+    _ = ws.send(f"echo: {message}")
+}
+
+func upperHandler(ws: WebSocket, req: Request) {
+    suffix: str = req.queryGet("suffix", "")
+    message: str = ws.recv()
+    _ = ws.send(Strings.toUpper(message) + suffix)
+}
+
+func main() {
+    server: Server = Server()
+    wsRoute(server, "/echo", echoHandler)
+    wsRoute(server, "/upper", upperHandler)
+    server.listenBackground(18686)
+
+    echoReply: str = ""
+    go! {
+        echoReply = wsClientRoundtrip("ws://127.0.0.1:18686/echo", "hello")
+    }
+    print(f"echo reply: {echoReply}")
+
+    upperReply: str = ""
+    go! {
+        upperReply = wsClientRoundtrip("ws://127.0.0.1:18686/upper?suffix=!", "world")
+    }
+    print(f"upper reply: {upperReply}")
+
+    server.close()
+    print("ok")
+}
