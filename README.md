@@ -1,75 +1,44 @@
 # @lam/vulture/ws-plugin
 
-`@lam/vulture/ws-plugin` adds WebSocket upgrades, message I/O, origin policy,
-subprotocol negotiation, and per-message compression to
-[`@lam/vulture`](https://github.com/thallium-solutions/lam-vulture). It is the
-standalone Lam 1.17 package extracted from `lamserver_ws` in the
-[Lammergeier language repository](https://github.com/thallium-solutions/lammergeier-lang).
-The wire implementation uses
-[`github.com/gorilla/websocket`](https://github.com/gorilla/websocket) v1.5.3,
-matching the central library pin.
+`@lam/vulture/ws-plugin` adds WebSocket upgrades, text and binary frame I/O,
+origin policy, subprotocol negotiation, and per-message compression to
+[`@lam/vulture`](https://github.com/thallium-solutions/lam-vulture). The wire
+implementation uses
+[`github.com/gorilla/websocket`](https://github.com/gorilla/websocket) v1.5.3.
 
-## Features
-
-- `wsRoute` for a simple WebSocket GET endpoint.
-- `wsRouteOpts` for exact origin allow-lists, server-selected subprotocols, and
-  RFC 7692 permessage-deflate negotiation.
-- Text and binary send/receive operations, ping, idempotent close, connection
-  state, and an advanced native-connection escape hatch.
-- The upgraded request remains an `@lam/vulture` `Request`, including query
-  parameters, headers, cookies, context, and hooks executed before the route.
-- Automatic connection close when a handler returns.
-
-The package deliberately keeps `github.com/gorilla/websocket` as a separate Go
-dependency, so applications that only use `@lam/vulture` HTTP routes do not ship
-a WebSocket implementation.
+Version 2 follows `@lam/vulture` 2.0 conventions: expected failures use
+unsuffixed `Result[T]` APIs, route configuration uses typed `RouteOptions`
+overloads, and package classes use `init` constructors.
 
 ## Requirements
 
-- `lamc` 1.17.0 or newer within the compatible 1.x line (`^1.17`).
-- `@lam/vulture` v1.0.0. The Git release is pinned in `lamlib.toml` and is
-  resolved transitively for consumers.
+- `lamc` 1.18.0 or newer within the compatible 1.x line (`^1.18`).
+- `@lam/vulture` v2.0.0. The Git release is pinned in `lamlib.toml`.
 - A Go toolchain supported by Lammergeier and Gorilla WebSocket v1.5.3.
 
 ## Installation
 
-### Git release
-
-Install the tagged source directly from this package's GitHub repository:
+Install the tagged Git release:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-vulture-ws-plugin.git@v1.0.0
+lamc install https://github.com/thallium-solutions/lam-vulture-ws-plugin.git@v2.0.0
 ```
 
-Pin a release tag or commit for reproducible builds rather than tracking a
-branch. The package manifest installs `@lam/vulture` v1.0.0 transitively.
-
-### Registry
-
-After the package is published to a configured Lam registry:
+After publication to a configured registry:
 
 ```bash
-lamc install @lam/vulture/ws-plugin@1.0.0
+lamc install @lam/vulture/ws-plugin@2.0.0
 ```
 
-A project may instead declare a compatible registry constraint and run
-`lamc install`:
+Or declare a compatible dependency:
 
 ```toml
 [dependencies]
-"@lam/vulture/ws-plugin" = "^1.0.0"
+"@lam/vulture/ws-plugin" = "^2.0.0"
 ```
 
-### Local package
-
-Install a checkout directly:
-
-```bash
-lamc install /path/to/lam-vulture-ws-plugin
-```
-
-For sibling-checkout development, keep canonical imports and use project-local
-path resolution:
+For sibling-checkout development, retain canonical imports and use local path
+resolution:
 
 ```toml
 [dependencies]
@@ -79,202 +48,199 @@ path resolution:
 "@lam/vulture" = { path = "../lam-vulture" }
 ```
 
-Then run `lamc install` in the application directory. The test runner uses the
-same consumer shape without changing global state: it stages this checkout at
-`extlibs/@lam/vulture/ws-plugin` and the sibling core checkout at
-`extlibs/@lam/vulture`.
-
 ## Quick start
 
-Import HTTP types from the core package and WebSocket APIs from this plugin:
-
 ```lammergeier
-from @lam/vulture import Server, Request
+from @lam/vulture import Request, Server
 from @lam/vulture/ws-plugin import WebSocket, wsRoute
 
-func echo(ws: WebSocket, req: Request) {
+func echo(ws: WebSocket, _req: Request) {
     while not ws.isClosed() {
-        message: str = ws.recv()
-        if message == "" {
+        incoming = ws.receive()
+        if not incoming.ok() {
             return
         }
-        if not ws.send(f"echo: {message}") {
+        message: str = incoming.unwrap()
+        if not ws.send("echo: " + message).ok() {
             return
         }
     }
 }
 
 func main() {
-    server: Server = Server()
-    wsRoute(server, "/echo", echo)
-    server.listen(8080)
+    app: Server = Server()
+    registered: bool = wsRoute(app, "/echo", echo).unwrap()
+    listening: bool = app.listen(8080).unwrap()
 }
 ```
 
-Connect to `ws://127.0.0.1:8080/echo`. The handler runs once for the lifetime of
-the upgraded connection. When it returns, the plugin sends a normal Close frame
-and closes the underlying connection.
+Connect to `ws://127.0.0.1:8080/echo`. A handler runs for the lifetime of its
+upgraded connection. The plugin sends a normal close frame and closes the
+native connection when the handler returns or panics.
 
-## Origin policy
+## Typed route options
 
-`wsRoute` preserves the central helper's permissive default and accepts every
-`Origin`. That is convenient for local development but is not a production
-cross-origin policy. Use `wsRouteOpts` with an exact allow-list on internet-facing
-servers:
+`wsRoute` is overloaded rather than paired with an `Opts`-suffixed helper:
 
 ```lammergeier
-from @lam/vulture import Server, Request
-from @lam/vulture/ws-plugin import WebSocket, wsRouteOpts
-
-func events(ws: WebSocket, req: Request) {
-    ws.send("connected")
-}
-
-func main() {
-    server: Server = Server()
-    wsRouteOpts(server, "/events", events, {
-        "originAllowList": [
-            "https://app.example.com",
-            "https://admin.example.com",
-        ],
-    })
-    server.listen(8080)
-}
+wsRoute(server, path, handler) -> Result[bool]
+wsRoute(server, path, handler, options: RouteOptions) -> Result[bool]
 ```
 
-Matching is exact against the request's `Origin` header. With a non-empty list,
-a missing or unlisted origin is rejected by the Gorilla upgrader with HTTP 403.
-Use the complete origin (`scheme://host[:port]`), not a path or wildcard.
-Authentication and authorization should still run in `@lam/vulture` hooks; an
-origin check is not an identity check.
-
-## Subprotocol negotiation
-
-List protocols in server preference order. Gorilla selects the first supported
-entry also offered by the client, and the handler reads the negotiated value
-from `ws.subprotocol`:
-
-```lammergeier
-from @lam/vulture import Server, Request
-from @lam/vulture/ws-plugin import WebSocket, wsRouteOpts
-
-func rpc(ws: WebSocket, req: Request) {
-    if ws.subprotocol == "jsonrpc-v2" {
-        ws.send("{\"jsonrpc\":\"2.0\",\"result\":\"ready\",\"id\":1}")
-        return
-    }
-    ws.send("ready")
-}
-
-func configure(server: Server) {
-    wsRouteOpts(server, "/rpc", rpc, {
-        "subprotocols": ["jsonrpc-v2", "chat-v1"],
-        "originAllowList": ["https://app.example.com"],
-    })
-}
-```
-
-`ws.subprotocol` is `""` when no protocol is negotiated. Applications that
-require a protocol should validate it in the handler and close unsupported
-connections.
-
-## Compression
-
-Enable RFC 7692 permessage-deflate negotiation per route:
-
-```lammergeier
-wsRouteOpts(server, "/stream", streamHandler, {
-    "compression": true,
-    "originAllowList": ["https://app.example.com"],
-})
-```
-
-Compression is used only when the client also requests it. It can reduce large
-text payloads but costs CPU and can amplify secret-exposure risks when attacker-
-controlled and secret data share compressed messages. Leave it disabled for
-small messages or sensitive mixed-content streams.
-
-Origin, subprotocol, and compression options can be combined:
-
-```lammergeier
-wsRouteOpts(server, "/socket", socketHandler, {
-    "originAllowList": ["https://app.example.com"],
-    "subprotocols": ["events-v1"],
-    "compression": true,
-})
-```
-
-## API
-
-### Routes
-
-```lammergeier
-wsRoute(server, path, handler)
-wsRouteOpts(server, path, handler, options)
-```
-
-A handler has the shape `func(ws: WebSocket, req: Request)`. Both helpers
-register a GET route and bind the user handler during the normal
-`@lam/vulture` request-hook pipeline. A successful HTTP upgrade hijacks the
-response, so ordinary response serialization and successful-response hooks do
-not write to that connection afterward.
-
-`wsRouteOpts` recognizes:
+The second overload preserves all core `RouteOptions` behavior, including
+per-route limits, timeouts, hooks, schemas, OpenAPI fields, and metadata.
+WebSocket upgrade settings use these metadata keys:
 
 | Key | Type | Behavior |
 | --- | --- | --- |
 | `originAllowList` | `list[str]` | Exact allowed `Origin` values; empty or omitted accepts all origins. |
 | `subprotocols` | `list[str]` | Server-supported protocols in preference order. |
-| `compression` | `bool` | Enables permessage-deflate negotiation when `true`. |
+| `compression` | `bool` | Enables RFC 7692 permessage-deflate negotiation. |
 
-### `WebSocket`
+Metadata is intentionally heterogeneous in core Vulture. The plugin validates
+its keys before registering a route and returns
+`WebSocketConfigurationError` for an invalid value instead of silently
+ignoring it or panicking.
+
+```lammergeier
+from @lam/vulture import Request, Response, RouteOptions, Server
+from @lam/vulture/ws-plugin import WebSocket, wsRoute
+
+func authenticated(req: Request, res: Response) {
+    if req.header("Authorization") == "" {
+        res.code(401).text("missing credentials")
+    }
+}
+
+func events(ws: WebSocket, _req: Request) {
+    _sent: bool = ws.send("connected").unwrap()
+}
+
+func configure(app: Server) {
+    options: RouteOptions = RouteOptions(0, 30000)
+    _ = options.preHandler(authenticated)
+    _ = options.metadata("originAllowList", [
+        "https://app.example.com",
+        "https://admin.example.com",
+    ])
+    _ = options.metadata("subprotocols", ["events-v2", "events-v1"])
+    _ = options.metadata("compression", true)
+    _registered: bool = wsRoute(app, "/events", events, options).unwrap()
+}
+```
+
+Origin matching is exact against the request's `Origin` header. With a
+non-empty allow-list, a missing or unlisted origin is rejected with HTTP 403.
+Use complete origins (`scheme://host[:port]`), not paths or wildcards.
+Authentication and authorization still belong in Vulture hooks; an origin
+check is not an identity check.
+
+`ws.subprotocol` contains the negotiated protocol or `""` when none was
+selected. Compression is active only when the client also requests it. It can
+reduce large messages but costs CPU and can expose secrets when attacker-
+controlled and secret data share compressed messages.
+
+## Result-based frame API
+
+Operational failures never share a false, empty-string, or `None` sentinel
+with valid data:
 
 | Member | Result | Notes |
 | --- | --- | --- |
-| `send(message)` | `bool` | Sends one UTF-8 text frame. |
-| `recv()` | `str` | Blocks for the next text frame; skips binary frames and returns `""` on close/error. |
-| `sendBytes(data)` | `bool` | Sends a native Go `[]byte` as one binary frame. |
-| `recvBytes()` | `any` | Blocks for the next binary frame; skips text frames and returns `None` on close/error. |
-| `ping()` | `bool` | Sends a Ping control frame. |
+| `send(message)` | `Result[bool]` | Sends one UTF-8 text frame. |
+| `receive()` | `Result[str]` | Blocks for a text frame and skips binary frames. `Ok("")` is a valid empty frame. |
+| `sendBytes(data)` | `Result[bool]` | Sends a native Go `[]byte` as one binary frame. |
+| `receiveBytes()` | `Result[any]` | Blocks for a binary frame and skips text frames. An empty byte slice is successful. |
+| `ping()` | `Result[bool]` | Sends a Ping control frame. |
 | `close()` | `None` | Best-effort normal close; safe to call repeatedly. |
 | `isClosed()` | `bool` | Reports wrapper close/error state. |
-| `subprotocol` | `str` | Protocol selected during the handshake, or `""`. |
+| `subprotocol` | `str` | Negotiated protocol or `""`. |
 | `rawConn()` | `any` | Returns `*websocket.Conn` for advanced native operations. |
 
-Binary sending intentionally preserves the central API's native byte boundary.
-For example, advanced code can obtain a Go byte slice with a narrowly scoped
-`go!` expression before calling `sendBytes`. Prefer text messages when a native
-byte value is not otherwise needed.
+Error kinds are stable enough for callers to inspect through `result.error`:
 
-## Concurrency, deadlines, and lifecycle
+- `WebSocketClosedError` — an operation was attempted after close, or a normal
+  peer close was received.
+- `WebSocketConnectionError` — the wrapper has no usable native connection.
+- `WebSocketSendError` / `WebSocketReceiveError` — frame transport failed.
+- `WebSocketDataError` — `sendBytes` did not receive a native `[]byte`.
+- `WebSocketConfigurationError` — route/upgrade metadata is invalid.
+- `WebSocketUpgradeError` — no live HTTP transport was available or the
+  handshake failed.
 
-- `recv` and `recvBytes` block. Run a receive loop through Lam concurrency APIs
-  when the rest of the application must continue independently.
+A receive loop can therefore distinguish a valid empty message from closure
+without consulting `isClosed`:
+
+```lammergeier
+result = ws.receive()
+if not result.ok() {
+    print(str(result.error))
+    return
+}
+message: str = result.unwrap()  # may legitimately be ""
+```
+
+Binary methods retain the package's native byte boundary. Keep construction or
+inspection of Go `[]byte` values in a narrowly scoped `go!` block, or prefer
+text frames when a native byte value is not otherwise required.
+
+## Low-level upgrade
+
+`wsRoute` is the normal API. Plugins that already own a Vulture route can use
+the unsuffixed low-level operation:
+
+```lammergeier
+wsUpgrade(req, res, options: RouteOptions) -> Result[WebSocket]
+```
+
+Configuration, missing native HTTP transport, and Gorilla handshake failures
+are returned as typed errors. Missing-transport and invalid-configuration HTTP
+responses use Vulture's fluent `res.code(...).text(...)` API. Gorilla writes
+its own protocol handshake failure response; the plugin marks that response as
+handled so Vulture does not write a second one.
+
+Callers of `wsUpgrade` own the successful connection and should close it. The
+higher-level `wsRoute` overloads close automatically.
+
+## Concurrency and lifecycle
+
+- `receive` and `receiveBytes` block. Use Lam concurrency when other work must
+  continue independently.
 - Gorilla supports one concurrent reader and one concurrent writer. Serialize
   multiple writers in application code.
 - `ping` is application-managed; the wrapper does not start a heartbeat loop.
-- The wrapper marks itself closed on frame I/O errors. `recv() == ""` can also
-  represent an empty text message, so call `isClosed()` when the distinction
-  matters.
-- `rawConn()` is the escape hatch for native read/write deadlines, control
-  handlers, compression tuning, and frame features not represented by the
-  stable Lam API. Those operations require Gorilla's native types and should
-  remain in small `go!` boundaries.
+- Any frame I/O failure marks the wrapper closed.
+- `rawConn()` is the escape hatch for native deadlines, control handlers,
+  compression tuning, and frame features outside the stable Lam API.
+
+## Migrating from 1.x
+
+Version 2 is intentionally breaking:
+
+- Replace `wsRouteOpts(server, path, handler, dict)` with the four-argument
+  `wsRoute` overload and a `RouteOptions` value. Move WebSocket settings into
+  `RouteOptions.metadata`.
+- Handle or unwrap the `Result[bool]` returned by `wsRoute`.
+- Handle `Result` from `send`, `sendBytes`, `ping`, `receive`, and `receiveBytes`.
+  `receive() == ""` and `receiveBytes() == None` are no longer close/error tests.
+- Custom construction follows Lam 1.18's `init` convention; `__init__` is gone.
+- Upgrade and configuration failures are explicit `Result` errors.
+
+See [CHANGELOG.md](CHANGELOG.md) for the release summary.
 
 ## Implementation boundary
 
-Connection state guards, close-state queries, and the missing-handler response
-use Lam directly. Native Go remains where behavior depends on Gorilla frame
-constants and connection methods, dynamic Go type assertions, HTTP
-`ResponseWriter`/`Request` integration and hijacking, and the exact
-`func(*Request, *Response)` callback type required by `@lam/vulture` hooks. The
-hermetic test client likewise keeps WebSocket frames and its read deadline at
-the native boundary. The copied uppercase test helper was replaced with the
-behavior-equivalent `lamstrings.Strings.toUpper` call.
+Route registration, hook registration through `RouteOptions.preHandler`,
+response errors, Result handling, and connection dispatch use Lam APIs. The
+route-local binding callback is constructed at the native boundary because Lam
+1.18 cannot lower a capturing void lambda to Vulture's exact
+`func(*Request, *Response)` hook type. Native Go also remains where Gorilla
+frame constants and connections, `http.ResponseWriter`, and dynamic metadata
+validation require it.
 
 ## Testing
 
-Place complete sibling checkouts at `../lam-vulture` and
+Place sibling checkouts at `../lam-vulture` and
 `../lam-vulture-ws-plugin`, then run:
 
 ```bash
@@ -283,11 +249,11 @@ python3 tests/run_tests.py
 lamc lib run test
 ```
 
-The runner requires a compatible `lamc`, stages both packages in a temporary
+The runner requires `lamc ^1.18`, stages both packages in a temporary
 consumer-style `extlibs` tree, compiles every `tests/test_*.lam` file without
-cache, executes it, and compares stdout exactly with its `# expect:` directives.
-It performs no registry or network installation.
+cache, executes it, and compares stdout with its `# expect:` directives. It
+performs no registry or network installation.
 
 ## License
 
-Apache-2.0. See `lamlib.toml` for package metadata.
+Apache-2.0. See `LICENSE` and `lamlib.toml`.

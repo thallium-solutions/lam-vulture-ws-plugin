@@ -1,0 +1,223 @@
+# Complex WebSocket contract: typed route configuration and hooks, empty and
+# binary frames, ping control frames, origin/subprotocol policy, and closure.
+# expect: empty path config error: true
+# expect: compression config error: true
+# expect: origins config error: true
+# expect: protocols config error: true
+# expect: inject status: 500
+# expect: inject body: ws: not on http path
+# expect: initially closed: false
+# expect: closed flag: true
+# expect: closed receive error: true
+# expect: closed bytes error: true
+# expect: closed send error: true
+# expect: closed sendBytes error: true
+# expect: closed ping error: true
+# expect: text route registered: true
+# expect: binary route registered: true
+# expect: close route registered: true
+# expect: listen result: true
+# expect: route hook ran: true
+# expect: query reached handler: true
+# expect: subprotocol negotiated: true
+# expect: empty frame preserved: true
+# expect: denied origin status: 403
+# expect: binary frame type: true
+# expect: empty binary preserved: true
+# expect: ping succeeded: true
+# expect: normal close observed: true
+# expect: send after close failed: true
+
+from @lam/vulture import Server, Request, Response, RouteOptions, InjectResponse
+from @lam/vulture/ws-plugin import WebSocket, wsRoute
+from lamerrors import Result
+
+
+go! {
+    import (
+        "fmt"
+        "github.com/gorilla/websocket"
+        "io"
+        "net/http"
+        "sync/atomic"
+        "time"
+    )
+
+    var lamWsSendAfterCloseFailed int64
+
+    func lamWsDial(rawURL, origin, protocol string) (*websocket.Conn, *http.Response, error) {
+        dialer := websocket.Dialer{
+            HandshakeTimeout: 2 * time.Second,
+            EnableCompression: true,
+        }
+        if protocol != "" {
+            dialer.Subprotocols = []string{protocol}
+        }
+        headers := http.Header{}
+        if origin != "" {
+            headers.Set("Origin", origin)
+        }
+        return dialer.Dial(rawURL, headers)
+    }
+
+    func lamWsText(rawURL, origin, protocol, message string) string {
+        conn, response, err := lamWsDial(rawURL, origin, protocol)
+        if err != nil {
+            if response != nil {
+                _, _ = io.ReadAll(response.Body)
+                response.Body.Close()
+                return fmt.Sprintf("DENIED:%d", response.StatusCode)
+            }
+            return "ERROR:" + err.Error()
+        }
+        defer conn.Close()
+        if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+            return "ERROR:" + err.Error()
+        }
+        _ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+        _, payload, err := conn.ReadMessage()
+        if err != nil {
+            return "ERROR:" + err.Error()
+        }
+        return string(payload) + "|sub=" + conn.Subprotocol()
+    }
+
+    func lamWsBinary(rawURL, origin string) string {
+        conn, _, err := lamWsDial(rawURL, origin, "")
+        if err != nil {
+            return "ERROR:" + err.Error()
+        }
+        defer conn.Close()
+        if err := conn.WriteMessage(websocket.BinaryMessage, []byte{}); err != nil {
+            return "ERROR:" + err.Error()
+        }
+        _ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+        kind, payload, err := conn.ReadMessage()
+        if err != nil {
+            return "ERROR:" + err.Error()
+        }
+        _, marker, err := conn.ReadMessage()
+        if err != nil {
+            return "ERROR:" + err.Error()
+        }
+        return fmt.Sprintf("%d:%d|%s", kind, len(payload), string(marker))
+    }
+
+    func lamWsObserveClose(rawURL, origin string) bool {
+        conn, _, err := lamWsDial(rawURL, origin, "")
+        if err != nil {
+            return false
+        }
+        defer conn.Close()
+        _ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+        _, _, err = conn.ReadMessage()
+        return websocket.IsCloseError(err, websocket.CloseNormalClosure)
+    }
+}
+
+func routeHook(req: Request, res: Response) {
+    req.ctx["wsHook"] = "yes"
+}
+
+func textHandler(ws: WebSocket, req: Request) {
+    message: str = ws.receive().unwrap()
+    reply: str = "hook=" + str(req.ctx["wsHook"]) + "|q=" +
+    req.queryGet("q", "missing") + "|empty=" + str(message == "")
+    _ = ws.send(reply).unwrap()
+}
+
+func binaryHandler(ws: WebSocket, req: Request) {
+    payload: any = ws.receiveBytes().unwrap()
+    pinged: bool = ws.ping().unwrap()
+    _ = ws.sendBytes(payload).unwrap()
+    _ = ws.send("ping=" + str(pinged)).unwrap()
+}
+
+func closeHandler(ws: WebSocket, req: Request) {
+    ws.close()
+    failed: bool = not ws.send("after-close").ok()
+    go! {
+        if failed {
+            atomic.StoreInt64(&lamWsSendAfterCloseFailed, 1)
+        }
+    }
+}
+
+func main() {
+    validationServer: Server = Server()
+    callback: func(WebSocket, Request) = textHandler
+    print("empty path config error: " + str(not wsRoute(validationServer, "", callback).ok()))
+
+    badCompression: RouteOptions = RouteOptions()
+    _ = badCompression.metadata("compression", "yes")
+    print("compression config error: " + str(not wsRoute(validationServer, "/bad-compression", callback, badCompression).ok()))
+    badOrigins: RouteOptions = RouteOptions()
+    _ = badOrigins.metadata("originAllowList", "https://allowed.local")
+    print("origins config error: " + str(not wsRoute(validationServer, "/bad-origins", callback, badOrigins).ok()))
+    badProtocols: RouteOptions = RouteOptions()
+    _ = badProtocols.metadata("subprotocols", ["chat.v2", ""])
+    print("protocols config error: " + str(not wsRoute(validationServer, "/bad-protocols", callback, badProtocols).ok()))
+
+    server: Server = Server()
+    options: RouteOptions = RouteOptions()
+    _ = options.preHandler(routeHook)
+    _ = options.metadata("compression", true)
+    _ = options.metadata("originAllowList", ["https://allowed.local"])
+    _ = options.metadata("subprotocols", ["chat.v2"])
+    textRegistered: Result[bool] = wsRoute(server, "/text", callback, options)
+    binaryCallback: func(WebSocket, Request) = binaryHandler
+    closeCallback: func(WebSocket, Request) = closeHandler
+    binaryRegistered: Result[bool] = wsRoute(server, "/binary", binaryCallback, RouteOptions().metadata("originAllowList", ["https://allowed.local"]))
+    closeRegistered: Result[bool] = wsRoute(server, "/close", closeCallback, RouteOptions().metadata("originAllowList", ["https://allowed.local"]))
+
+    injected: InjectResponse = server.inject("GET", "/text")
+    print(f"inject status: {injected.status}")
+    print("inject body: " + injected.body)
+
+    closed: WebSocket = WebSocket()
+    print("initially closed: " + str(closed.isClosed()))
+    closed.close()
+    print("closed flag: " + str(closed.isClosed()))
+    print("closed receive error: " + str(not closed.receive().ok()))
+    print("closed bytes error: " + str(not closed.receiveBytes().ok()))
+    print("closed send error: " + str(not closed.send("x").ok()))
+    print("closed sendBytes error: " + str(not closed.sendBytes(None).ok()))
+    print("closed ping error: " + str(not closed.ping().ok()))
+    print("text route registered: " + str(textRegistered.ok()))
+    print("binary route registered: " + str(binaryRegistered.ok()))
+    print("close route registered: " + str(closeRegistered.ok()))
+
+    listening: Result[bool] = server.listenBackground(0)
+    print("listen result: " + str(listening.ok()))
+    base: str = "ws://" + server.boundAddr
+    origin: str = "https://allowed.local"
+
+    textReply: str = ""
+    emptyReply: str = ""
+    deniedReply: str = ""
+    binaryReply: str = ""
+    normalClose: bool = false
+    go! {
+        textReply = lamWsText(base+"/text?q=ok", origin, "chat.v2", "hello")
+        emptyReply = lamWsText(base+"/text?q=empty", origin, "chat.v2", "")
+        deniedReply = lamWsText(base+"/text?q=no", "https://denied.local", "chat.v2", "hello")
+        binaryReply = lamWsBinary(base+"/binary", origin)
+        normalClose = lamWsObserveClose(base+"/close", origin)
+    }
+    print("route hook ran: " + str(textReply.contains("hook=yes")))
+    print("query reached handler: " + str(textReply.contains("q=ok")))
+    print("subprotocol negotiated: " + str(textReply.contains("sub=chat.v2")))
+    print("empty frame preserved: " + str(emptyReply.contains("empty=true")))
+    print("denied origin status: " + deniedReply[7:])
+    print("binary frame type: " + str(binaryReply.startsWith("2:")))
+    print("empty binary preserved: " + str(binaryReply.contains("2:0")))
+    print("ping succeeded: " + str(binaryReply.contains("ping=true")))
+    print("normal close observed: " + str(normalClose))
+    sendFailed: bool = false
+    go! {
+        sendFailed = atomic.LoadInt64(&lamWsSendAfterCloseFailed) == 1
+    }
+    print("send after close failed: " + str(sendFailed))
+
+    server.close()
+}

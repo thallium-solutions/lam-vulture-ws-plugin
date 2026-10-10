@@ -2,196 +2,256 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # @lam/vulture/ws-plugin adds WebSocket routes to @lam/vulture.
-# Import with: from @lam/vulture/ws-plugin import WebSocket, wsRoute, wsRouteOpts
+# Import with: from @lam/vulture/ws-plugin import WebSocket, wsRoute, wsUpgrade
 
-from @lam/vulture import Server, Request, Response
+from @lam/vulture import Server, Request, Response, RouteOptions
+from lamerrors import Result, Error
 
 go! {
     import (
         "fmt"
         "net/http"
-        "os"
-        "strings"
 
         "github.com/gorilla/websocket"
     )
 
-    // Permissive default upgrader: accept any Origin so existing
-    // development clients can connect without additional configuration.
-    var lamWsUpgrader = websocket.Upgrader{
-        ReadBufferSize:  1024,
-        WriteBufferSize: 1024,
-        CheckOrigin:     func(r *http.Request) bool { return true },
+    func lamWsStringList(value interface{}, name string) ([]string, error) {
+        if value == nil {
+            return nil, nil
+        }
+        switch list := value.(type) {
+        case []string:
+            out := append([]string(nil), list...)
+            for _, item := range out {
+                if item == "" {
+                    return nil, fmt.Errorf("%s entries must not be empty", name)
+                }
+            }
+            return out, nil
+        case []interface{}:
+            out := make([]string, 0, len(list))
+            for _, value := range list {
+                item, ok := value.(string)
+                if !ok || item == "" {
+                    return nil, fmt.Errorf("%s must contain only non-empty strings", name)
+                }
+                out = append(out, item)
+            }
+            return out, nil
+        default:
+            return nil, fmt.Errorf("%s must be a list of strings", name)
+        }
     }
 
-    // Build a fresh upgrader for each configured route. The native boundary
-    // is required for Gorilla's option types, HTTP origin callback, and the
-    // dynamic Lam-to-Go collection assertions.
-    func lamWsBuildUpgrader(opts map[string]interface{}) *websocket.Upgrader {
+    // WebSocket-specific values live in RouteOptions.meta so one typed options
+    // object carries both Vulture route hooks/limits and upgrade configuration.
+    func lamWsBuildUpgrader(opts *RouteOptions) (*websocket.Upgrader, error) {
         u := &websocket.Upgrader{
             ReadBufferSize:  1024,
             WriteBufferSize: 1024,
         }
-        if subs, ok := opts["subprotocols"].([]string); ok {
-            u.Subprotocols = subs
-        } else if list, ok := opts["subprotocols"].([]interface{}); ok {
-            for _, v := range list {
-                if s, ok := v.(string); ok {
-                    u.Subprotocols = append(u.Subprotocols, s)
-                }
+        if opts == nil {
+            u.CheckOrigin = func(r *http.Request) bool { return true }
+            return u, nil
+        }
+
+        meta := opts.Meta
+        protocols, err := lamWsStringList(meta["subprotocols"], "subprotocols")
+        if err != nil {
+            return nil, err
+        }
+        origins, err := lamWsStringList(meta["originAllowList"], "originAllowList")
+        if err != nil {
+            return nil, err
+        }
+        compression := false
+        if value, exists := meta["compression"]; exists {
+            enabled, ok := value.(bool)
+            if !ok {
+                return nil, fmt.Errorf("compression must be a bool")
             }
+            compression = enabled
         }
-        if v, ok := opts["compression"].(bool); ok && v {
-            u.EnableCompression = true
-        }
-        if list, ok := opts["originAllowList"].([]string); ok && len(list) > 0 {
-            allow := make(map[string]struct{}, len(list))
-            for _, origin := range list {
+
+        u.Subprotocols = protocols
+        u.EnableCompression = compression
+        if len(origins) == 0 {
+            u.CheckOrigin = func(r *http.Request) bool { return true }
+        } else {
+            allow := make(map[string]struct{}, len(origins))
+            for _, origin := range origins {
                 allow[origin] = struct{}{}
-            }
-            u.CheckOrigin = func(r *http.Request) bool {
-                origin := r.Header.Get("Origin")
-                _, ok := allow[origin]
-                return ok
-            }
-        } else if list, ok := opts["originAllowList"].([]interface{}); ok && len(list) > 0 {
-            allow := make(map[string]struct{}, len(list))
-            for _, value := range list {
-                if origin, ok := value.(string); ok {
-                    allow[origin] = struct{}{}
-                }
             }
             u.CheckOrigin = func(r *http.Request) bool {
                 _, ok := allow[r.Header.Get("Origin")]
                 return ok
             }
-        } else {
-            u.CheckOrigin = func(r *http.Request) bool { return true }
         }
-        return u
+        return u, nil
     }
 }
 
 class WebSocket {
     #- Wraps a ``*websocket.Conn`` after a successful HTTP upgrade.
-    Methods block. Drive ``recv()`` from Lam concurrency primitives when
-    an application needs non - blocking orchestration. -  #
+    Message operations use Result values so an empty frame, a normal close,
+    and a transport failure are never represented by the same sentinel. -#
 
-    func __init__(self) {
+    func init(self) {
         self.conn: any = None
         self.closed: bool = false
         self.subprotocol: str = ""
     }
 
-    func send(self, msg: str) -> bool {
-        #- Send one text message. Returns ``false`` after a close or error. -#
+    func send(self, msg: str) -> Result[bool] {
+        #- Send one text message. -#
         if self.closed {
-            return false
+            return Result.Err(Error("WebSocketClosedError", "the connection is closed", None))
         }
         go! {
             c, ok := s.Conn.(*websocket.Conn)
             if !ok {
                 s.Closed = true
-                return false
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketConnectionError", "the native connection is unavailable", nil,
+                ))
             }
             if err := c.WriteMessage(websocket.TextMessage, []byte(msg)); err != nil {
                 s.Closed = true
-                return false
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketSendError", err.Error(), nil,
+                ))
             }
-            return true
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func sendBytes(self, data: any) -> bool {
-        #- Send a binary message. ``data`` must contain a native Go ``[]byte``;
-        advanced callers can construct one in a narrowly scoped ``go!``
-        expression. -  #
+    func sendBytes(self, data: any) -> Result[bool] {
+        #- Send a native Go ``[]byte`` as one binary message. -#
         if self.closed {
-            return false
+            return Result.Err(Error("WebSocketClosedError", "the connection is closed", None))
         }
         go! {
             c, ok := s.Conn.(*websocket.Conn)
             if !ok {
                 s.Closed = true
-                return false
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketConnectionError", "the native connection is unavailable", nil,
+                ))
             }
             buf, ok := data.([]byte)
             if !ok {
-                return false
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketDataError", "sendBytes requires a native []byte", nil,
+                ))
             }
             if err := c.WriteMessage(websocket.BinaryMessage, buf); err != nil {
                 s.Closed = true
-                return false
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketSendError", err.Error(), nil,
+                ))
             }
-            return true
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func recv(self) -> str {
-        #- Block until a text message arrives. Binary messages are skipped.
-        Returns ``""`` when the connection closes or fails. -  #
+    func receive(self) -> Result[str] {
+        #- Block for the next text message, skipping binary messages.
+        An empty text frame is ``Ok("")``; close and read failures are errors. -#
         if self.closed {
-            return ""
+            return Result.Err(Error("WebSocketClosedError", "the connection is closed", None))
         }
         go! {
             c, ok := s.Conn.(*websocket.Conn)
             if !ok {
                 s.Closed = true
-                return ""
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketConnectionError", "the native connection is unavailable", nil,
+                ))
             }
             for {
                 messageType, message, err := c.ReadMessage()
                 if err != nil {
                     s.Closed = true
-                    return ""
+                    if websocket.IsCloseError(
+                        err,
+                        websocket.CloseNormalClosure,
+                        websocket.CloseGoingAway,
+                        websocket.CloseNoStatusReceived,
+                    ) {
+                        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                            "WebSocketClosedError", err.Error(), nil,
+                        ))
+                    }
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                        "WebSocketReceiveError", err.Error(), nil,
+                    ))
                 }
                 if messageType == websocket.TextMessage {
-                    return string(message)
+                    return LAMMERGEIER.Result.Ok(string(message))
                 }
             }
         }
     }
 
-    func recvBytes(self) -> any {
-        #- Block until a binary message arrives. Text messages are skipped.
-        Returns the native ``[]byte`` payload or ``None`` on close. -  #
+    func receiveBytes(self) -> Result[any] {
+        #- Block for the next binary message, skipping text messages.
+        An empty byte slice is successful; close and read failures are errors. -#
         if self.closed {
-            return None
+            return Result.Err(Error("WebSocketClosedError", "the connection is closed", None))
         }
         go! {
             c, ok := s.Conn.(*websocket.Conn)
             if !ok {
                 s.Closed = true
-                return nil
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketConnectionError", "the native connection is unavailable", nil,
+                ))
             }
             for {
                 messageType, message, err := c.ReadMessage()
                 if err != nil {
                     s.Closed = true
-                    return nil
+                    if websocket.IsCloseError(
+                        err,
+                        websocket.CloseNormalClosure,
+                        websocket.CloseGoingAway,
+                        websocket.CloseNoStatusReceived,
+                    ) {
+                        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                            "WebSocketClosedError", err.Error(), nil,
+                        ))
+                    }
+                    return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                        "WebSocketReceiveError", err.Error(), nil,
+                    ))
                 }
                 if messageType == websocket.BinaryMessage {
-                    return message
+                    return LAMMERGEIER.Result.Ok(message)
                 }
             }
         }
     }
 
-    func ping(self) -> bool {
+    func ping(self) -> Result[bool] {
         #- Send a control-frame ping for application-managed keep-alive. -#
         if self.closed {
-            return false
+            return Result.Err(Error("WebSocketClosedError", "the connection is closed", None))
         }
         go! {
             c, ok := s.Conn.(*websocket.Conn)
             if !ok {
-                return false
+                s.Closed = true
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketConnectionError", "the native connection is unavailable", nil,
+                ))
             }
             if err := c.WriteMessage(websocket.PingMessage, nil); err != nil {
                 s.Closed = true
-                return false
+                return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                    "WebSocketSendError", err.Error(), nil,
+                ))
             }
-            return true
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
@@ -224,95 +284,145 @@ class WebSocket {
     }
 }
 
-func wsUpgradeHandler(req: Request, res: Response) {
-    #- Internal HTTP route handler that upgrades and dispatches a connection. -#
-    handler: any = req.ctx["__wsHandler"]
-    upgraderOpts: any = req.ctx["__wsUpgrader"]
-    if handler == None {
-        res.status = 500
-        res.body = "ws: no handler bound"
-        res.sent = true
-        return
-    }
+func wsValidateOptions(opts: RouteOptions) -> Result[bool] {
+    #- Validate WebSocket values stored in ``RouteOptions.meta``. -#
     go! {
-        // The normal HTTP dispatcher stores these native values on Request.
-        // Injection-only requests cannot be upgraded.
-        w, writerOK := req.RawWriter.(http.ResponseWriter)
-        r, requestOK := req.RawHttp.(*http.Request)
-        if !writerOK || !requestOK {
-            res.Status = 500
-            res.Body = "ws: not on http path"
-            res.Sent = true
-            return
+        _, err := lamWsBuildUpgrader(opts)
+        if err != nil {
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                "WebSocketConfigurationError", err.Error(), nil,
+            ))
         }
+        return LAMMERGEIER.Result.Ok(true)
+    }
+}
 
-        var upgrader *websocket.Upgrader
-        if opts, ok := upgraderOpts.(map[string]interface{}); ok {
-            upgrader = lamWsBuildUpgrader(opts)
-        } else {
-            upgrader = &lamWsUpgrader
+func wsUpgrade(req: Request, res: Response, opts: RouteOptions) -> Result[WebSocket] {
+    #- Upgrade a live HTTP request. Configuration and handshake failures are
+    returned as typed errors. Gorilla may already have written the handshake
+    failure response; Vulture is marked hijacked to prevent a second write. -#
+    configuration: Result[bool] = wsValidateOptions(opts)
+    if not configuration.ok() {
+        res.code(500).text("ws: invalid configuration: " + str(configuration.error))
+        return Result.Err(configuration.error)
+    }
+
+    rawReady: bool = false
+    go! {
+        _, writerOK := req.RawWriter.(http.ResponseWriter)
+        _, requestOK := req.RawHttp.(*http.Request)
+        rawReady = writerOK && requestOK
+    }
+    if not rawReady {
+        res.code(500).text("ws: not on http path")
+        return Result.Err(Error(
+        "WebSocketUpgradeError",
+        "the request does not expose a native HTTP writer and request",
+        None,
+        ))
+    }
+
+    go! {
+        w := req.RawWriter.(http.ResponseWriter)
+        r := req.RawHttp.(*http.Request)
+        upgrader, configErr := lamWsBuildUpgrader(opts)
+        if configErr != nil {
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                "WebSocketConfigurationError", configErr.Error(), nil,
+            ))
         }
-
         conn, err := upgrader.Upgrade(w, r, nil)
         if err != nil {
-            // Upgrade writes its own HTTP failure. Mark the response hijacked
-            // so @lam/vulture does not write a second response.
             res.Hijacked = true
             res.Sent = true
-            return
+            return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+                "WebSocketUpgradeError", err.Error(), nil,
+            ))
         }
         res.Hijacked = true
         res.Sent = true
-
         ws := NewWebSocket()
         ws.Conn = conn
         ws.Subprotocol = conn.Subprotocol()
-        defer func() {
-            if !ws.Closed {
-                ws.Close()
+        return LAMMERGEIER.Result.Ok(ws)
+    }
+}
+
+func wsBoundHandler(req: Request) -> func(WebSocket, Request) {
+    go! {
+        return req.Ctx.GetItem("__wsHandler").(func(*WebSocket, *Request))
+    }
+}
+
+func wsBoundOptions(req: Request) -> RouteOptions {
+    go! {
+        return req.Ctx.GetItem("__wsOptions").(*RouteOptions)
+    }
+}
+
+func wsRouteHandler(req: Request, res: Response) {
+    #- Internal typed Vulture handler. The route-local preHandler places the
+    callback and options in request context before this runs. -#
+    handler: func(WebSocket, Request) = wsBoundHandler(req)
+    opts: RouteOptions = wsBoundOptions(req)
+    upgraded: Result[WebSocket] = wsUpgrade(req, res, opts)
+    if not upgraded.ok() {
+        return
+    }
+    ws: WebSocket = upgraded.unwrap()
+    defer ws.close()
+    handler(ws, req)
+}
+
+func wsBindingHook(
+handler: func(WebSocket, Request),
+opts: RouteOptions,
+) -> func(Request, Response) {
+    #- Build the one native capturing callback required to bind route-local
+    WebSocket state. Registration still goes through RouteOptions.preHandler. -#
+    go! {
+        previous := opts.PreHandlerHook
+        return func(req *Request, res *Response) {
+            if hook, ok := previous.(func(*Request, *Response)); ok {
+                hook(req, res)
             }
-        }()
-        // Keep a user panic inside this connection's HTTP goroutine.
-        defer func() { _ = recover() }()
-        if fn, ok := handler.(func(*WebSocket, *Request)); ok {
-            fn(ws, req)
-        } else {
-            fmt.Fprintln(os.Stderr, "ws handler has wrong signature; want func(*WebSocket, *Request)")
+            req.Ctx.Set("__wsHandler", handler)
+            req.Ctx.Set("__wsOptions", opts)
         }
     }
 }
 
-func wsRoute(srv: Server, path: str, handler: any) {
-    #- Register a permissive WebSocket GET endpoint. The handler signature is
-    ``func(ws: WebSocket, req: Request)``. Use ``wsRouteOpts`` to constrain
-    origins or enable protocol negotiation and compression. -  #
-    go! {
-        // Keep the native callback boundary: @lam/vulture's dispatcher
-        // requires the exact func(*Request, *Response) Go signature.
-        bind := func(req *Request, res *Response) {
-            if req.Path == path && strings.EqualFold(req.Method, "GET") {
-                req.Ctx.Set("__wsHandler", handler)
-            }
-        }
-        srv.OnRequestHooks = append(srv.OnRequestHooks, bind)
-    }
-    srv.get(path, wsUpgradeHandler, None, "json")
+func wsRoute(
+srv: Server,
+path: str,
+handler: func(WebSocket, Request),
+) -> Result[bool] {
+    #- Register a permissive WebSocket GET endpoint. -#
+    return wsRoute(srv, path, handler, RouteOptions())
 }
 
-func wsRouteOpts(srv: Server, path: str, handler: any, opts: any) {
-    #- Register a WebSocket GET endpoint with a ``dict[str, any]`` containing
-    ``subprotocols``, ``compression``, and / or ``originAllowList``. -  #
-    go! {
-        // Options need a Go map assertion before being passed to Gorilla.
-        bind := func(req *Request, res *Response) {
-            if req.Path == path && strings.EqualFold(req.Method, "GET") {
-                req.Ctx.Set("__wsHandler", handler)
-                if optsMap, ok := opts.(map[string]interface{}); ok {
-                    req.Ctx.Set("__wsUpgrader", optsMap)
-                }
-            }
-        }
-        srv.OnRequestHooks = append(srv.OnRequestHooks, bind)
+func wsRoute(
+srv: Server,
+path: str,
+handler: func(WebSocket, Request),
+opts: RouteOptions,
+) -> Result[bool] {
+    #- Register a WebSocket GET endpoint with Vulture's typed RouteOptions.
+    WebSocket metadata keys are ``originAllowList``, ``subprotocols``, and
+    ``compression``. Invalid metadata returns WebSocketConfigurationError. -#
+    if path == "" {
+        return Result.Err(Error(
+        "WebSocketConfigurationError",
+        "the route path must not be empty",
+        None,
+        ))
     }
-    srv.get(path, wsUpgradeHandler, None, "json")
+    configuration: Result[bool] = wsValidateOptions(opts)
+    if not configuration.ok() {
+        return configuration
+    }
+    binding: func(Request, Response) = wsBindingHook(handler, opts)
+    opts = opts.preHandler(binding)
+    srv.get(path, wsRouteHandler, opts)
+    return Result.Ok(true)
 }

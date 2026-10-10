@@ -1,12 +1,21 @@
-# Ported central lamserver_ws test: verifies an upgrade + echo round-trip and
-# that route query parameters survive the upgrade for the handler.
+# @lam/vulture/ws-plugin v2: typed route, upgrade, and frame Result APIs.
 #
+# expect: inject status: 500
+# expect: inject body: ws: not on http path
+# expect: config error: true
+# expect: closed receive error: true
+# expect: closed receiveBytes error: true
+# expect: closed send error: true
+# expect: closed sendBytes error: true
+# expect: closed ping error: true
 # expect: echo reply: echo: hello
+# expect: empty reply preserved: true
 # expect: upper reply: WORLD!
+# expect: binary reply: bytes
 # expect: ok
 
 from lamstrings import Strings
-from @lam/vulture import Server, Request
+from @lam/vulture import Server, Request, Response, RouteOptions, InjectResponse
 from @lam/vulture/ws-plugin import WebSocket, wsRoute
 
 go! {
@@ -21,7 +30,7 @@ go! {
 
     // The native test client intentionally retains Gorilla frame operations,
     // net/http handshake types, and a read deadline.
-    func wsClientRoundtrip(rawURL, message string) string {
+    func wsClientRoundtrip(rawURL, message string, messageType int) string {
         parsed, parseErr := url.Parse(rawURL)
         if parseErr != nil {
             return "ERR-parse: " + parseErr.Error()
@@ -37,7 +46,7 @@ go! {
             return "ERR-dial: " + err.Error() + extra
         }
         defer conn.Close()
-        if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+        if err := conn.WriteMessage(messageType, []byte(message)); err != nil {
             return "ERR-write: " + err.Error()
         }
         _ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -50,36 +59,86 @@ go! {
 }
 
 func echoHandler(ws: WebSocket, _req: Request) {
-    message: str = ws.recv()
-    if message == "" {
-        return
-    }
-    _ = ws.send(f"echo: {message}")
+    message: str = ws.receive().unwrap()
+    sent: bool = ws.send(f"echo: {message}").unwrap()
 }
 
 func upperHandler(ws: WebSocket, req: Request) {
     suffix: str = req.queryGet("suffix", "")
-    message: str = ws.recv()
-    _ = ws.send(Strings.toUpper(message) + suffix)
+    if str(req.ctx["routeHook"]) != "yes" {
+        suffix = "?"
+    }
+    message: str = ws.receive().unwrap()
+    sent: bool = ws.send(Strings.toUpper(message) + suffix).unwrap()
+}
+
+func binaryHandler(ws: WebSocket, _req: Request) {
+    payload: any = ws.receiveBytes().unwrap()
+    pinged: bool = ws.ping().unwrap()
+    sent: bool = ws.sendBytes(payload).unwrap()
+}
+
+func routeHook(req: Request, res: Response) {
+    req.ctx["routeHook"] = "yes"
+    _ = res.header("X-WebSocket-Route", "typed")
 }
 
 func main() {
     server: Server = Server()
-    wsRoute(server, "/echo", echoHandler)
-    wsRoute(server, "/upper", upperHandler)
-    server.listenBackground(18686)
+    echoCallback: func(WebSocket, Request) = echoHandler
+    upperCallback: func(WebSocket, Request) = upperHandler
+    binaryCallback: func(WebSocket, Request) = binaryHandler
+    echoRegistered: bool = wsRoute(server, "/echo", echoCallback).unwrap()
+
+    options: RouteOptions = RouteOptions()
+    _ = options.preHandler(routeHook)
+    _ = options.metadata("compression", false)
+    _ = options.metadata("subprotocols", ["echo-v2"])
+    upperRegistered: bool = wsRoute(server, "/upper", upperCallback, options).unwrap()
+    binaryRegistered: bool = wsRoute(server, "/binary", binaryCallback).unwrap()
+
+    injected: InjectResponse = server.inject("GET", "/echo")
+    print(f"inject status: {injected.status}")
+    print(f"inject body: {injected.body}")
+
+    invalid: RouteOptions = RouteOptions()
+    _ = invalid.metadata("compression", "yes")
+    print("config error: " + str(not wsRoute(server, "/invalid", echoCallback, invalid).ok()))
+
+    closed: WebSocket = WebSocket()
+    closed.close()
+    print("closed receive error: " + str(not closed.receive().ok()))
+    print("closed receiveBytes error: " + str(not closed.receiveBytes().ok()))
+    print("closed send error: " + str(not closed.send("x").ok()))
+    print("closed sendBytes error: " + str(not closed.sendBytes(None).ok()))
+    print("closed ping error: " + str(not closed.ping().ok()))
+
+    listening: bool = server.listenBackground(0).unwrap()
+    base: str = "ws://" + server.boundAddr
 
     echoReply: str = ""
     go! {
-        echoReply = wsClientRoundtrip("ws://127.0.0.1:18686/echo", "hello")
+        echoReply = wsClientRoundtrip(base+"/echo", "hello", websocket.TextMessage)
     }
     print(f"echo reply: {echoReply}")
 
+    emptyReply: str = ""
+    go! {
+        emptyReply = wsClientRoundtrip(base+"/echo", "", websocket.TextMessage)
+    }
+    print("empty reply preserved: " + str(emptyReply == "echo: "))
+
     upperReply: str = ""
     go! {
-        upperReply = wsClientRoundtrip("ws://127.0.0.1:18686/upper?suffix=!", "world")
+        upperReply = wsClientRoundtrip(base+"/upper?suffix=!", "world", websocket.TextMessage)
     }
     print(f"upper reply: {upperReply}")
+
+    binaryReply: str = ""
+    go! {
+        binaryReply = wsClientRoundtrip(base+"/binary", "bytes", websocket.BinaryMessage)
+    }
+    print(f"binary reply: {binaryReply}")
 
     server.close()
     print("ok")
