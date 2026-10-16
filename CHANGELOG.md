@@ -2,6 +2,15 @@
 
 All notable changes to `@lam/vulture/ws-plugin` are documented here.
 
+## 2.0.1 - 2026-10-16
+
+### Fixed
+
+- The `@lam/vulture` dependency pointed at the tag `v2.0.0`, which is not
+  published (release tags are plain versions), so installing the package from
+  Git failed. It now pins `@lam/vulture` `2.0.1`, the release this package is
+  tested with.
+
 ## 2.0.0 - 2026-09-30
 
 ### Added

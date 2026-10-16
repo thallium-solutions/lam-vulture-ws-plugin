@@ -13,7 +13,7 @@ overloads, and package classes use `init` constructors.
 ## Requirements
 
 - `lamc` 1.18.0 or newer within the compatible 1.x line (`^1.18`).
-- `@lam/vulture` v2.0.0. The Git release is pinned in `lamlib.toml`.
+- `@lam/vulture` 2.0.1. The Git release is pinned in `lamlib.toml`.
 - A Go toolchain supported by Lammergeier and Gorilla WebSocket v1.5.3.
 
 ## Installation
@@ -21,20 +21,20 @@ overloads, and package classes use `init` constructors.
 Install the tagged Git release:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-vulture-ws-plugin.git@v2.0.0
+lamc install https://github.com/thallium-solutions/lam-vulture-ws-plugin.git@2.0.1
 ```
 
 After publication to a configured registry:
 
 ```bash
-lamc install @lam/vulture/ws-plugin@2.0.0
+lamc install @lam/vulture/ws-plugin@2.0.1
 ```
 
 Or declare a compatible dependency:
 
 ```toml
 [dependencies]
-"@lam/vulture/ws-plugin" = "^2.0.0"
+"@lam/vulture/ws-plugin" = "^2.0.1"
 ```
 
 For sibling-checkout development, retain canonical imports and use local path
