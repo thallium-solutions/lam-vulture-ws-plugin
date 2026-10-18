@@ -1,6 +1,6 @@
 [library]
 name = "@lam/vulture/ws-plugin"
-version = "2.0.1"
+version = "2.0.2"
 description = "WebSocket routes and connections for @lam/vulture"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
@@ -8,10 +8,10 @@ homepage = "https://github.com/thallium-solutions/lam-vulture-ws-plugin"
 repository = "https://github.com/thallium-solutions/lam-vulture-ws-plugin"
 
 [compatibility]
-lamc = "^1.18"
+lamc = ">=1.18, <3"
 
 [dependencies]
-"@lam/vulture" = { git = "https://github.com/thallium-solutions/lam-vulture.git", ref = "2.0.1" }
+"@lam/vulture" = { git = "https://github.com/thallium-solutions/lam-vulture.git", ref = "2.0.2" }
 
 [go-deps]
 "github.com/gorilla/websocket" = "v1.5.3"
