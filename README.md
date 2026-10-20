@@ -12,7 +12,7 @@ overloads, and package classes use `init` constructors.
 
 ## Requirements
 
-- `lamc` 1.18.0 or newer including 2.x (`>=1.18, <3`).
+- `lamc` 1.18.0 or newer including 2.x (`>=1.18, <4`).
 - `@lam/vulture` 2.0.2. The Git release is pinned in `lamlib.toml`.
 - A Go toolchain supported by Lammergeier and Gorilla WebSocket v1.5.3.
 
@@ -249,7 +249,7 @@ python3 tests/run_tests.py
 lamc lib run test
 ```
 
-The runner requires `lamc >=1.18, <3`, stages both packages in a temporary
+The runner requires `lamc >=1.18, <4`, stages both packages in a temporary
 consumer-style `extlibs` tree, compiles every `tests/test_*.lam` file without
 cache, executes it, and compares stdout with its `# expect:` directives. It
 performs no registry or network installation.
