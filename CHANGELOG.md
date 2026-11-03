@@ -2,6 +2,14 @@
 
 All notable changes to `@lam/vulture/ws-plugin` are documented here.
 
+## [2.0.4] - 2026-11-03
+
+### Changed
+
+- Compatible with `lamc` 4.x and `@lam/vulture` 3.0.0 (handlers may return
+  `html`, `xml`, `json` or `str`): pins `@lam/vulture` 3.0.0 and declares
+  `compatibility.lamc = ">=4.0, <5"` (test runner too).
+
 ## [2.0.3] - 2026-10-20
 
 ### Changed

@@ -45,9 +45,9 @@ def require_lamc() -> str:
     if match is None:
         raise SystemExit(f"error: unrecognized lamc version output: {version_text!r}")
     version = tuple(int(match.group(index)) for index in range(1, 4))
-    if version < (1, 18, 0) or version >= (4, 0, 0):
+    if version < (4, 0, 0) or version >= (5, 0, 0):
         raise SystemExit(
-            "error: @lam/vulture/ws-plugin tests require lamc >=1.18, <4; "
+            "error: @lam/vulture/ws-plugin tests require lamc >=4.0, <5; "
             f"found {version_text}"
         )
     return lamc
