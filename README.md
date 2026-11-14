@@ -21,13 +21,13 @@ overloads, and package classes use `init` constructors.
 Install the tagged Git release:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-vulture-ws-plugin.git@2.0.1
+lamc install https://github.com/thallium-solutions/lam-vulture-ws-plugin.git@2.0.5
 ```
 
 After publication to a configured registry:
 
 ```bash
-lamc install @lam/vulture/ws-plugin@2.0.1
+lamc install @lam/vulture/ws-plugin@2.0.5
 ```
 
 Or declare a compatible dependency:

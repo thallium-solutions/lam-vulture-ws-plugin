@@ -2,6 +2,19 @@
 
 All notable changes to `@lam/vulture/ws-plugin` are documented here.
 
+## [2.0.5] - 2026-11-14
+
+### Tests
+
+- `tests/test_websocket_chat_hub_stress.lam`: a `ChatHub` class over
+  `wsRoute` (bound methods as handlers) broadcasting to 6 concurrent clients
+  with per-connection write locks, as the README's concurrency section asks;
+  8 async tasks writing 200 frames to one connection through that lock;
+  non-ASCII text, a 1 MiB text frame and a binary frame with every byte
+  value; a normal client close (`WebSocketClosedError`) and an abrupt TCP
+  drop (`WebSocketReceiveError`) with `isClosed`; an allowed origin and an
+  unsupported subprotocol.
+
 ## [2.0.4] - 2026-11-03
 
 ### Changed

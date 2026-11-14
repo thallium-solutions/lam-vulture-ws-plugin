@@ -1,0 +1,378 @@
+# Cross-feature stress: a `ChatHub` class over `wsRoute` broadcasts every
+# message to all connected clients, serialising the writers of each
+# connection with a mutex as the README asks; 6 clients connect and talk
+# concurrently. Also: 8 async tasks writing to one connection through the
+# hub's per-connection lock (200 frames, none lost or interleaved),
+# non-ASCII text frames, a 1 MiB text frame, a binary frame with every byte
+# value, a normal client close (`WebSocketClosedError`) and an abrupt TCP
+# drop (`WebSocketReceiveError`) seen by the server, `isClosed`, an allowed
+# origin, and an unsupported subprotocol (none negotiated).
+#
+# expect: chat: 6 clients each received 30 messages, order kept per sender: true
+# expect: chat non-ASCII: true
+# expect: concurrent writers: 200/200 frames, distinct=200
+# expect: large text: 1048576 bytes echoed=true
+# expect: binary: 256 bytes byte-exact=true
+# expect: client close: WebSocketClosedError closed=true
+# expect: abrupt drop: WebSocketReceiveError closed=true
+# expect: allowed origin: 101
+# expect: unsupported subprotocol: negotiated=""
+# expect: ok
+
+from @lam/vulture import Server, Request, RouteOptions
+from @lam/vulture/ws-plugin import WebSocket, wsRoute
+from lamconcurrency import Mutex
+from lamerrors import Result
+from lamtime import Time
+
+go! {
+    import (
+        "fmt"
+        "net/http"
+        "sort"
+        "strings"
+        "sync"
+        "time"
+
+        "github.com/gorilla/websocket"
+    )
+
+    func hubDial(url string, header http.Header, protocols []string) (*websocket.Conn, int, error) {
+        dialer := websocket.Dialer{HandshakeTimeout: 3 * time.Second, Subprotocols: protocols}
+        conn, resp, err := dialer.Dial(url, header)
+        status := 0
+        if resp != nil {
+            status = resp.StatusCode
+        }
+        return conn, status, err
+    }
+
+    // hubChat connects n clients, waits until all joined, sends `per`
+    // messages from each, and returns how many messages each client read
+    // and whether every sender's messages arrived in order.
+    func hubChat(url string, n int, per int) (int, bool, bool) {
+        conns := make([]*websocket.Conn, n)
+        for i := 0; i < n; i++ {
+            c, _, err := hubDial(url, nil, nil)
+            if err != nil {
+                return -1, false, false
+            }
+            conns[i] = c
+            // Each client reads its own "joined" acknowledgement first.
+            c.SetReadDeadline(time.Now().Add(5 * time.Second))
+            if _, msg, err := c.ReadMessage(); err != nil || string(msg) != "joined" {
+                return -2, false, false
+            }
+        }
+        var wg sync.WaitGroup
+        counts := make([]int, n)
+        ordered := make([]bool, n)
+        unicode := make([]bool, n)
+        total := n * per
+        for i := 0; i < n; i++ {
+            wg.Add(1)
+            go func(i int) {
+                defer wg.Done()
+                last := map[string]int{}
+                ordered[i] = true
+                unicode[i] = true
+                for counts[i] < total {
+                    conns[i].SetReadDeadline(time.Now().Add(10 * time.Second))
+                    _, msg, err := conns[i].ReadMessage()
+                    if err != nil {
+                        return
+                    }
+                    var sender string
+                    var seq int
+                    text := string(msg)
+                    if _, err := fmt.Sscanf(text, "%s %d", &sender, &seq); err != nil {
+                        continue
+                    }
+                    if prev, ok := last[sender]; ok && seq != prev+1 {
+                        ordered[i] = false
+                    }
+                    last[sender] = seq
+                    if !strings.HasSuffix(text, "Grüße 🦅") {
+                        unicode[i] = false
+                    }
+                    counts[i]++
+                }
+            }(i)
+        }
+        var senders sync.WaitGroup
+        for i := 0; i < n; i++ {
+            senders.Add(1)
+            go func(i int) {
+                defer senders.Done()
+                for k := 0; k < per; k++ {
+                    _ = conns[i].WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("c%d %d Grüße 🦅", i, k)))
+                }
+            }(i)
+        }
+        senders.Wait()
+        wg.Wait()
+        allOrdered, allUnicode := true, true
+        for i := 0; i < n; i++ {
+            if counts[i] != total {
+                return counts[i], false, false
+            }
+            allOrdered = allOrdered && ordered[i]
+            allUnicode = allUnicode && unicode[i]
+            conns[i].WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+            conns[i].Close()
+        }
+        return total, allOrdered, allUnicode
+    }
+
+    // hubCollect reads n frames from url and returns how many arrived and
+    // how many were distinct.
+    func hubCollect(url string, n int) (int, int) {
+        c, _, err := hubDial(url, nil, nil)
+        if err != nil {
+            return -1, 0
+        }
+        defer c.Close()
+        seen := map[string]bool{}
+        got := 0
+        for got < n {
+            c.SetReadDeadline(time.Now().Add(10 * time.Second))
+            _, msg, err := c.ReadMessage()
+            if err != nil {
+                break
+            }
+            got++
+            seen[string(msg)] = true
+        }
+        return got, len(seen)
+    }
+
+    func hubEcho(url string, messageType int, payload []byte) []byte {
+        c, _, err := hubDial(url, nil, nil)
+        if err != nil {
+            return nil
+        }
+        defer c.Close()
+        if err := c.WriteMessage(messageType, payload); err != nil {
+            return nil
+        }
+        c.SetReadDeadline(time.Now().Add(10 * time.Second))
+        _, reply, err := c.ReadMessage()
+        if err != nil {
+            return nil
+        }
+        return reply
+    }
+
+    func hubCloseNormally(url string) {
+        c, _, err := hubDial(url, nil, nil)
+        if err != nil {
+            return
+        }
+        c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
+        time.Sleep(100 * time.Millisecond)
+        c.Close()
+    }
+
+    func hubDropAbruptly(url string) {
+        c, _, err := hubDial(url, nil, nil)
+        if err != nil {
+            return
+        }
+        c.UnderlyingConn().Close()
+    }
+
+    func hubAllBytes() []byte {
+        raw := make([]byte, 256)
+        for i := range raw {
+            raw[i] = byte(i)
+        }
+        return raw
+    }
+
+    func hubSorted(values []string) string {
+        sort.Strings(values)
+        return strings.Join(values, ",")
+    }
+}
+
+class Member {
+    func init(self, ws: WebSocket) {
+        self.ws: WebSocket = ws
+        self.lock: Mutex = Mutex()
+    }
+
+    func send(self, text: str) -> Result[bool] {
+        self.lock.lock()
+        defer self.lock.unlock()
+        return self.ws.send(text)
+    }
+}
+
+class ChatHub {
+    func init(self, expected: int) {
+        self.lock: Mutex = Mutex()
+        self.members: list[Member] = []
+        self.expected: int = expected
+        self.closeKinds: list[str] = []
+        self.closedFlags: list[bool] = []
+    }
+
+    func join(self, ws: WebSocket, _req: Request) {
+        member: Member = Member(ws)
+        self.lock.lock()
+        self.members.append(member)
+        self.lock.unlock()
+        _ = member.send("joined")
+        while true {
+            r: Result[str] = ws.receive()
+            if not r.ok() {
+                break
+            }
+            self.broadcast(r.unwrap())
+        }
+    }
+
+    func broadcast(self, text: str) {
+        self.lock.lock()
+        targets: list[Member] = [m for m in self.members]
+        self.lock.unlock()
+        for member in targets {
+            _ = member.send(text)
+        }
+    }
+
+    func flood(self, ws: WebSocket, _req: Request) {
+        member: Member = Member(ws)
+        writers = [writerTask(member, w) for w in range(8)]
+        for task in writers {
+            _ = await task
+        }
+        _ = ws.receive()
+    }
+
+    func echo(self, ws: WebSocket, _req: Request) {
+        text: Result[str] = ws.receive()
+        if text.ok() {
+            _ = ws.send(text.unwrap())
+        }
+    }
+
+    func echoBytes(self, ws: WebSocket, _req: Request) {
+        data: Result[any] = ws.receiveBytes()
+        if data.ok() {
+            _ = ws.sendBytes(data.unwrap())
+        }
+    }
+
+    func watch(self, ws: WebSocket, _req: Request) {
+        r: Result[str] = ws.receive()
+        self.lock.lock()
+        self.closeKinds.append("ok" if r.ok() else r.error.kind)
+        self.closedFlags.append(ws.isClosed())
+        self.lock.unlock()
+    }
+
+    func protocol(self, ws: WebSocket, _req: Request) {
+        _ = ws.send(f"negotiated=\"{ws.subprotocol}\"")
+    }
+}
+
+async func writerTask(member: Member, w: int) -> int {
+    sent: int = 0
+    for k in range(25) {
+        if member.send(f"writer {w} frame {k}").ok() {
+            sent++
+        }
+    }
+    return sent
+}
+
+func waitFor(hub: ChatHub, n: int) {
+    for _ in range(100) {
+        hub.lock.lock()
+        done: bool = len(hub.closeKinds) >= n
+        hub.lock.unlock()
+        if done {
+            return
+        }
+        Time.sleepMs(20)
+    }
+}
+
+func main() {
+    hub: ChatHub = ChatHub(6)
+    server: Server = Server()
+    _ = wsRoute(server, "/chat", hub.join).unwrap()
+    _ = wsRoute(server, "/flood", hub.flood).unwrap()
+    _ = wsRoute(server, "/echo", hub.echo).unwrap()
+    _ = wsRoute(server, "/bytes", hub.echoBytes).unwrap()
+    _ = wsRoute(server, "/watch", hub.watch).unwrap()
+    origins: RouteOptions = RouteOptions()
+    _ = origins.metadata("originAllowList", ["https://app.example"])
+    _ = origins.metadata("subprotocols", ["chat.v2"])
+    _ = wsRoute(server, "/protocol", hub.protocol, origins).unwrap()
+    _ = server.listenBackground(0).unwrap()
+    base: str = "ws://" + server.boundAddr
+
+    received: int = 0
+    ordered: bool = false
+    unicode: bool = false
+    go! {
+        received, ordered, unicode = hubChat(base+"/chat", 6, 5)
+    }
+    print(f"chat: 6 clients each received {received} messages, order kept per sender: {ordered}")
+    print(f"chat non-ASCII: {unicode}")
+
+    frames: int = 0
+    distinct: int = 0
+    go! {
+        frames, distinct = hubCollect(base+"/flood", 200)
+    }
+    print(f"concurrent writers: {frames}/200 frames, distinct={distinct}")
+
+    large: str = "λ" * 524288
+    echoedLarge: str = ""
+    go! {
+        echoedLarge = string(hubEcho(base+"/echo", websocket.TextMessage, []byte(large)))
+    }
+    print(f"large text: {len(bytes(echoedLarge))} bytes echoed={echoedLarge == large}")
+
+    raw: str = ""
+    echoedRaw: str = ""
+    go! {
+        payload := hubAllBytes()
+        raw = string(payload)
+        echoedRaw = string(hubEcho(base+"/bytes", websocket.BinaryMessage, payload))
+    }
+    print(f"binary: {len(bytes(echoedRaw))} bytes byte-exact={echoedRaw == raw}")
+
+    go! {
+        hubCloseNormally(base + "/watch")
+    }
+    waitFor(hub, 1)
+    go! {
+        hubDropAbruptly(base + "/watch")
+    }
+    waitFor(hub, 2)
+    print(f"client close: {hub.closeKinds[0]} closed={hub.closedFlags[0]}")
+    print(f"abrupt drop: {hub.closeKinds[1]} closed={hub.closedFlags[1]}")
+
+    status: int = 0
+    negotiated: str = ""
+    go! {
+        header := http.Header{}
+        header.Set("Origin", "https://app.example")
+        conn, code, err := hubDial(base+"/protocol", header, []string{"chat.v9"})
+        status = code
+        if err == nil {
+            conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+            _, msg, _ := conn.ReadMessage()
+            negotiated = string(msg)
+            conn.Close()
+        }
+    }
+    print(f"allowed origin: {status}")
+    print(f"unsupported subprotocol: {negotiated}")
+    server.close()
+    print("ok")
+}
